@@ -20,7 +20,9 @@ from dask_kubernetes.operator._objects import (
     DaskJob,
     DaskWorkerGroup,
 )
-from dask_kubernetes.operator.networking import get_scheduler_address
+from dask_kubernetes.operator.networking import (
+    get_scheduler_address as get_scheduler_service_address
+)
 
 _ANNOTATION_NAMESPACES_TO_IGNORE = (
     "kopf.zalando.org",
@@ -116,7 +118,7 @@ def build_scheduler_service_spec(cluster_name, spec, annotations, labels):
 
 
 def build_worker_deployment_spec(
-    worker_group_name, namespace, cluster_name, uuid, pod_spec, annotations, labels
+    worker_group_name, scheduler_address, cluster_name, uuid, pod_spec, annotations, labels
 ):
     labels.update(
         **{
@@ -154,7 +156,7 @@ def build_worker_deployment_spec(
         },
         {
             "name": "DASK_SCHEDULER_ADDRESS",
-            "value": f"tcp://{cluster_name}-scheduler.{namespace}.svc.cluster.local:8786",
+            "value": scheduler_address,
         },
     ]
     for i in range(len(deployment_spec["spec"]["template"]["spec"]["containers"])):
@@ -243,6 +245,51 @@ def build_cluster_spec(name, worker_spec, scheduler_spec, annotations, labels):
     }
 
 
+cluster_context = {}
+
+
+async def get_scheduler_address(
+        cluster_name,
+        namespace,
+        port_name="tcp-comm",
+):
+    if (
+        cluster_name in cluster_context
+        and "service_enabled" in cluster_context[cluster_name]
+        and cluster_context[cluster_name]["service_enabled"]
+    ):
+        return await get_scheduler_service_address(
+            f"{cluster_name}-scheduler",
+            namespace,
+            port_name,
+            allow_external=False,
+        )
+    # service disable
+    while True:
+        with suppress(kr8s.NotFoundError):
+            scheduler_pod_label = {
+                "dask.org/cluster-name": cluster_name,
+                "dask.org/component": "scheduler"
+            }
+            scheduler_pod = await Pod.get(
+                label_selector=scheduler_pod_label,
+                namespace=namespace,
+            )
+            if scheduler_pod.status.hostIP:
+                ip = scheduler_pod.status.podIP
+                break
+        await asyncio.sleep(1)
+    port_candidates = [
+        port for port in scheduler_pod.spec.containers[0].ports
+        if port.name == port_name
+    ]
+    if len(port_candidates) == 0:
+        raise RuntimeError(f"Failed to get port:%{port_name} from scheduler")
+    port_spec = port_candidates.pop()
+    port = port_spec.containerPort
+    return f"tcp://{ip}:{port}"
+
+
 @kopf.on.startup()
 async def startup(settings: kopf.OperatorSettings, **kwargs):
     # Set server and client timeouts to reconnect from time to time.
@@ -303,15 +350,18 @@ async def daskcluster_create_components(
         f"Scheduler deployment {scheduler_deployment.name} created in {namespace}."
     )
 
-    # Create scheduler service
-    data = build_scheduler_service_spec(
-        name, scheduler_spec.get("service"), annotations, labels
-    )
-    kopf.adopt(data)
-    scheduler_service = await Service(data, namespace=namespace)
-    if not await scheduler_service.exists():
-        await scheduler_service.create()
-    logger.info(f"Scheduler service {data['metadata']['name']} created in {namespace}.")
+    cluster_context[name] = {"service_enabled": False}
+    if "service" in scheduler_spec and len(scheduler_spec.get("service")) > 0:
+        cluster_context[name]["service_enabled"] = True
+        # Create scheduler service
+        data = build_scheduler_service_spec(
+            name, scheduler_spec.get("service"), annotations, labels
+        )
+        kopf.adopt(data)
+        scheduler_service = await Service(data, namespace=namespace)
+        if not await scheduler_service.exists():
+            await scheduler_service.create()
+        logger.info(f"Scheduler service {data['metadata']['name']} created in {namespace}.")
 
     # Create default worker group
     worker_spec = spec.get("worker", {})
@@ -328,7 +378,15 @@ async def daskcluster_create_components(
         await worker_group.create()
     logger.info(f"Worker group {data['metadata']['name']} created in {namespace}.")
 
-    patch.status["phase"] = "Pending"
+    if cluster_context[name]["service_enabled"]:
+        patch.status["phase"] = "Pending"
+    else:
+        patch.status["phase"] = "Running"
+
+
+@kopf.on.delete("daskworkergroup.kubernetes.dask.org", optional=True)
+async def daskcluster_delete(name, namespace, **kwargs):
+    del cluster_context[name]
 
 
 @kopf.on.field("service", field="status", labels={"dask.org/component": "scheduler"})
@@ -367,14 +425,13 @@ async def daskworkergroup_create(body, namespace, logger, **kwargs):
 
 
 async def retire_workers(
-    n_workers, scheduler_service_name, worker_group_name, namespace, logger
+    n_workers, cluster_name, worker_group_name, namespace, logger
 ):
     # Try gracefully retiring via the HTTP API
     dashboard_address = await get_scheduler_address(
-        scheduler_service_name,
+        cluster_name,
         namespace,
         port_name="http-dashboard",
-        allow_external=False,
     )
     async with aiohttp.ClientSession() as session:
         url = f"{dashboard_address}/api/v1/retire_workers"
@@ -397,9 +454,8 @@ async def retire_workers(
     # Dask version mismatches between the operator and scheduler may cause this to fail in any number of unexpected ways
     with suppress(Exception):
         comm_address = await get_scheduler_address(
-            scheduler_service_name,
+            cluster_name,
             namespace,
-            allow_external=False,
         )
         async with rpc(comm_address) as scheduler_comm:
             workers_to_close = await scheduler_comm.workers_to_close(
@@ -422,13 +478,12 @@ async def retire_workers(
     return [w.name for w in workers[:-n_workers]]
 
 
-async def check_scheduler_idle(scheduler_service_name, namespace, logger):
+async def check_scheduler_idle(cluster_name, namespace, logger):
     # Try getting idle time via HTTP API
     dashboard_address = await get_scheduler_address(
-        scheduler_service_name,
+        cluster_name,
         namespace,
         port_name="http-dashboard",
-        allow_external=False,
     )
     async with aiohttp.ClientSession() as session:
         url = f"{dashboard_address}/api/v1/check_idle"
@@ -446,14 +501,13 @@ async def check_scheduler_idle(scheduler_service_name, namespace, logger):
 
     # Otherwise try gracefully checking via the RPC
     logger.debug(
-        f"Checking {scheduler_service_name} idleness failed via the HTTP API, falling back to the Dask RPC"
+        f"Checking {cluster_name} idleness failed via the HTTP API, falling back to the Dask RPC"
     )
     # Dask version mismatches between the operator and scheduler may cause this to fail in any number of unexpected ways
     with suppress(Exception):
         comm_address = await get_scheduler_address(
-            scheduler_service_name,
+            cluster_name,
             namespace,
-            allow_external=False,
         )
         async with rpc(comm_address) as scheduler_comm:
             idle_since = await scheduler_comm.check_idle()
@@ -463,7 +517,7 @@ async def check_scheduler_idle(scheduler_service_name, namespace, logger):
 
     # Finally fall back to code injection via the Dask RPC for distributed<=2023.3.1
     logger.debug(
-        f"Checking {scheduler_service_name} idleness failed via the Dask RPC, falling back to run_on_scheduler"
+        f"Checking {cluster_name} idleness failed via the Dask RPC, falling back to run_on_scheduler"
     )
 
     def idle_since(dask_scheduler=None):
@@ -473,9 +527,8 @@ async def check_scheduler_idle(scheduler_service_name, namespace, logger):
         return dask_scheduler.idle_since
 
     comm_address = await get_scheduler_address(
-        scheduler_service_name,
+        cluster_name,
         namespace,
-        allow_external=False,
     )
     async with rpc(comm_address) as scheduler_comm:
         response = await scheduler_comm.run_function(
@@ -491,13 +544,12 @@ async def check_scheduler_idle(scheduler_service_name, namespace, logger):
             return idle_since
 
 
-async def get_desired_workers(scheduler_service_name, namespace, logger):
+async def get_desired_workers(cluster_name, namespace, logger):
     # Try gracefully retiring via the HTTP API
     dashboard_address = await get_scheduler_address(
-        scheduler_service_name,
+        cluster_name,
         namespace,
         port_name="http-dashboard",
-        allow_external=False,
     )
     async with aiohttp.ClientSession() as session:
         url = f"{dashboard_address}/api/v1/adaptive_target"
@@ -510,9 +562,8 @@ async def get_desired_workers(scheduler_service_name, namespace, logger):
     # Dask version mismatches between the operator and scheduler may cause this to fail in any number of unexpected ways
     try:
         comm_address = await get_scheduler_address(
-            scheduler_service_name,
+            cluster_name,
             namespace,
-            allow_external=False,
         )
         async with rpc(comm_address) as scheduler_comm:
             return await scheduler_comm.adaptive_target()
@@ -575,10 +626,14 @@ async def daskworkergroup_replica_update(
             dask.config.get("kubernetes.controller.worker-allocation.delay") or 0
         )
         if workers_needed > 0:
+            scheduler_address = await get_scheduler_address(
+                cluster_name,
+                namespace,
+            )
             for _ in range(batch_size):
                 data = build_worker_deployment_spec(
                     worker_group_name=name,
-                    namespace=namespace,
+                    scheduler_address=scheduler_address,
                     cluster_name=cluster_name,
                     uuid=uuid4().hex[:10],
                     pod_spec=worker_spec["spec"],
@@ -599,7 +654,7 @@ async def daskworkergroup_replica_update(
         if workers_needed < 0:
             worker_ids = await retire_workers(
                 n_workers=-workers_needed,
-                scheduler_service_name=f"{cluster_name}-scheduler",
+                cluster_name=cluster_name,
                 worker_group_name=name,
                 namespace=namespace,
                 logger=logger,
@@ -792,7 +847,7 @@ async def daskautoscaler_adapt(spec, name, namespace, logger, **kwargs):
     # Ask the scheduler for the desired number of worker
     try:
         desired_workers = await get_desired_workers(
-            scheduler_service_name=f"{spec['cluster']}-scheduler",
+            cluster_name=spec['cluster'],
             namespace=namespace,
             logger=logger,
         )
@@ -836,7 +891,7 @@ async def daskcluster_autoshutdown(spec, name, namespace, logger, **kwargs):
     if spec["idleTimeout"]:
         try:
             idle_since = await check_scheduler_idle(
-                scheduler_service_name=f"{name}-scheduler",
+                cluster_name=name,
                 namespace=namespace,
                 logger=logger,
             )
